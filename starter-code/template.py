@@ -8,10 +8,12 @@ Instructions:
     3. Copy this file to solution/solution.py when done.
     4. Run: pytest tests/ -v
 """
-
+from google import genai
+from google.genai import types
 import os
 import time
 from typing import Any, Callable
+from openai import OpenAI
 
 # ---------------------------------------------------------------------------
 # Estimated costs per 1M INPUT & OUTPUT tokens (USD) as of March 2026
@@ -67,6 +69,38 @@ def call_openai(
     """
     # TODO: Import OpenAI, instantiate client, call chat.completions.create with parameters,
     #       measure execution start/end time, extract text and token usage, and return them.
+    # Khởi tạo client, API key sẽ tự động lấy từ os.getenv("OPENAI_API_KEY")
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    
+    # Định dạng tin nhắn gửi đi
+    messages = [{"role": "user", "content": prompt}]
+    
+    # Bắt đầu đo thời gian
+    start_time = time.time()
+    
+    # Gọi API tạo nội dung
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        top_p=top_p,
+        max_tokens=max_tokens
+    )
+    
+    # Kết thúc đo thời gian và tính toán độ trễ (latency)
+    latency_seconds = time.time() - start_time
+    
+    # Trích xuất nội dung trả về
+    response_text = response.choices[0].message.content
+    
+    # Trích xuất số lượng token usage vào một dictionary
+    usage = {
+        'input_tokens': response.usage.prompt_tokens,
+        'output_tokens': response.usage.completion_tokens
+    }
+    
+    # Trả về kết quả dưới dạng tuple
+    return response_text, latency_seconds, usage
     raise NotImplementedError("Implement call_openai")
 
 
@@ -115,6 +149,53 @@ def call_gemini(
     """
     # TODO: Initialize Gemini client, set config parameters, call generate_content,
     #       measure latency, extract response text and usage metadata, and return the tuple.
+    client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+    
+    # 2. Cấu hình các tham số thông qua GenerateContentConfig
+    config = types.GenerateContentConfig(
+        temperature=temperature,
+        top_p=top_p,
+        max_output_tokens=max_tokens
+    )
+    
+    try:
+        # 3. Bắt đầu đo thời gian (Latency)
+        start_time = time.time()
+        
+        # 4. Gọi API
+        response = client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=config
+        )
+        
+        # 5. Kết thúc đo thời gian
+        latency = time.time() - start_time
+        
+        # Lấy nội dung câu trả lời
+        response_text = response.text
+        
+        # 6. Lấy Token Usage từ usage_metadata
+        input_tokens = response.usage_metadata.prompt_token_count
+        output_tokens = response.usage_metadata.candidates_token_count
+        total_tokens = response.usage_metadata.total_token_count
+        
+        # Trả về kết quả
+        return {
+            "status": "success",
+            "content": response_text,
+            "latency_seconds": round(latency, 4),
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens
+        }
+        
+    except Exception as e:
+        # Xử lý lỗi nếu API key sai hoặc có sự cố mạng
+        return {
+            "status": "error",
+            "error_message": str(e)
+        }
     raise NotImplementedError("Implement call_gemini")
 
 
@@ -180,6 +261,79 @@ def compare_models(prompt: str) -> dict:
     # TODO: Calculate costs exactly based on input and output token counts using PRICING_1M_TOKENS
     #       Formula: Cost = (input_tokens * input_rate_per_1M + output_tokens * output_rate_per_1M) / 1,000,000
     # TODO: Assemble and return the comparison dictionary.
+    gpt4o_text, gpt4o_latency, gpt4o_usage = call_openai(prompt=prompt, model="gpt-4o")
+    
+    gpt4o_in_tok = gpt4o_usage.get("input_tokens", 0)
+    gpt4o_out_tok = gpt4o_usage.get("output_tokens", 0)
+    
+    # Tính cost: Cost = (input * rate_in + output * rate_out) / 1,000,000
+    gpt4o_cost = (
+        gpt4o_in_tok * PRICING_1M_TOKENS["gpt-4o"]["input"] + 
+        gpt4o_out_tok * PRICING_1M_TOKENS["gpt-4o"]["output"]
+    ) / 1_000_000
+
+
+    # --- 2. Gọi GPT-4o-mini ---
+    mini_text, mini_latency, mini_usage = call_openai(prompt=prompt, model="gpt-4o-mini")
+    
+    mini_in_tok = mini_usage.get("input_tokens", 0)
+    mini_out_tok = mini_usage.get("output_tokens", 0)
+    
+    mini_cost = (
+        mini_in_tok * PRICING_1M_TOKENS["gpt-4o-mini"]["input"] + 
+        mini_out_tok * PRICING_1M_TOKENS["gpt-4o-mini"]["output"]
+    ) / 1_000_000
+
+
+    # --- 3. Gọi Gemini 2.5 Flash ---
+    # Dựa vào Task 2, giả sử call_gemini trả về dictionary trực tiếp:
+    # {"content": str, "latency_seconds": float, "input_tokens": int, "output_tokens": int, ...}
+    gemini_result = call_gemini(prompt=prompt, model="gemini-2.5-flash")
+    
+    # Xử lý trường hợp có thể lỗi từ hàm call_gemini
+    if gemini_result.get("status") == "error":
+        gemini_text = f"Lỗi: {gemini_result.get('error_message')}"
+        gemini_latency = 0.0
+        gemini_in_tok = 0
+        gemini_out_tok = 0
+    else:
+        gemini_text = gemini_result.get("content", "")
+        gemini_latency = gemini_result.get("latency_seconds", 0.0)
+        gemini_in_tok = gemini_result.get("input_tokens", 0)
+        gemini_out_tok = gemini_result.get("output_tokens", 0)
+
+    gemini_cost = (
+        gemini_in_tok * PRICING_1M_TOKENS["gemini-2.5-flash"]["input"] + 
+        gemini_out_tok * PRICING_1M_TOKENS["gemini-2.5-flash"]["output"]
+    ) / 1_000_000
+
+
+    # --- 4. Tổng hợp và trả về kết quả ---
+    comparison_dict = {
+        "gpt4o": {
+            "response": gpt4o_text,
+            "latency": round(gpt4o_latency, 4),
+            "cost": gpt4o_cost,
+            "input_tokens": gpt4o_in_tok,
+            "output_tokens": gpt4o_out_tok
+        },
+        "gpt4o_mini": {
+            "response": mini_text,
+            "latency": round(mini_latency, 4),
+            "cost": mini_cost,
+            "input_tokens": mini_in_tok,
+            "output_tokens": mini_out_tok
+        },
+        "gemini_flash": {
+            "response": gemini_text,
+            "latency": round(gemini_latency, 4),
+            "cost": gemini_cost,
+            "input_tokens": gemini_in_tok,
+            "output_tokens": gemini_out_tok
+        }
+    }
+    
+    return comparison_dict
     raise NotImplementedError("Implement compare_models")
 
 
@@ -187,21 +341,80 @@ def compare_models(prompt: str) -> dict:
 # Task 5 — Streaming chatbot with Gemini 2.5 (Focus Model)
 # ---------------------------------------------------------------------------
 def streaming_chatbot() -> None:
-    """
-    Run an interactive streaming chatbot in the terminal using Gemini 2.5.
 
-    Behaviour:
-        - Streams response tokens from Gemini 2.5 Flash as they arrive.
-        - Maintains the last 3 turns of conversation history for context.
-        - Typing 'quit' or 'exit' ends the session.
+    client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+    
+    print("=" * 60)
+    print("🤖 CHATBOT GEMINI 2.5 FLASH (Chế độ Streaming)")
+    print("💡 Mẹo: Gõ 'quit' hoặc 'exit' để kết thúc.")
+    print("=" * 60)
 
-    Hints:
-        - Maintain a history list of conversation turns.
-        - Check how to stream responses using client.chats or model.generate_content(..., stream=True).
-        - Keep history limited to the last 3 turns to optimize context window and costs.
-    """
-    # TODO: Setup interactive session, prompt user for input, stream response, and update history.
+    # Khởi tạo mảng lưu trữ lịch sử
+    # Mỗi tin nhắn sẽ được lưu dưới dạng Dictionary tương thích với SDK
+    history = []
+    
+    while True:
+        try:
+            # 2. Nhận input từ người dùng
+            user_input = input("\nBạn: ")
+            
+            # Kiểm tra điều kiện thoát
+            if user_input.strip().lower() in ['quit', 'exit']:
+                print("\n👋 Đã thoát chatbot. Hẹn gặp lại!")
+                break
+            
+            # Bỏ qua nếu người dùng ấn Enter mà không nhập gì
+            if not user_input.strip():
+                continue
+                
+            # 3. Thêm tin nhắn của User vào lịch sử
+            history.append({
+                "role": "user", 
+                "parts": [{"text": user_input}]
+            })
+            
+            # 4. Giới hạn lịch sử (3 turns)
+            # 1 turn = 1 User + 1 Model (2 tin nhắn) -> 3 turns = 6 tin nhắn.
+            # Vì ta vừa thêm tin nhắn User mới, số lượng tối đa cần giữ là 7 tin nhắn.
+            if len(history) > 7:
+                history = history[-7:]
+                
+            print("Gemini: ", end="", flush=True)
+            
+            # 5. Gọi API ở chế độ Streaming
+            response_stream = client.models.generate_content_stream(
+                model=GEMINI_MODEL,
+                contents=history
+            )
+            
+            full_response = ""
+            
+            # 6. In từng chunk dữ liệu ngay khi nhận được
+            for chunk in response_stream:
+                if chunk.text:
+                    print(chunk.text, end="", flush=True)
+                    full_response += chunk.text
+                    
+            print() # Xuống dòng khi model hoàn tất câu trả lời
+            
+            # 7. Lưu câu trả lời của Model vào lịch sử để làm ngữ cảnh cho câu tiếp theo
+            history.append({
+                "role": "model", 
+                "parts": [{"text": full_response}]
+            })
+            
+        except KeyboardInterrupt:
+            # Xử lý khi người dùng nhấn Ctrl+C
+            print("\n\n⚠️ Đã ngắt kết nối. Thoát chatbot.")
+            sys.exit(0)
+            
+        except Exception as e:
+            print(f"\n\n❌ [Lỗi]: {e}")
+            # Nếu gọi API lỗi, hãy xóa tin nhắn user vừa thêm vào để tránh làm hỏng cấu trúc so le (user-model)
+            if history and history[-1]["role"] == "user":
+                history.pop()
     raise NotImplementedError("Implement streaming_chatbot")
+
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +441,23 @@ def retry_with_backoff(
         The last exception raised by fn() after all retries are exhausted.
     """
     # TODO: implement retry loop with exponential backoff
+    for attempt in range(max_retries + 1):
+        try:
+            # Thử gọi hàm
+            return fn()
+        except Exception as e:
+            # Nếu đã hết số lần thử lại (attempt == max_retries), ném ra lỗi cuối cùng
+            if attempt == max_retries:
+                raise e
+            
+            # Tính toán thời gian chờ: delay = base_delay * (2 ^ attempt)
+            delay = base_delay * (2 ** attempt)
+            
+            # Có thể in ra log để theo dõi quá trình retry (tuỳ chọn)
+            print(f"[Cảnh báo] Lỗi xảy ra: {e}. Thử lại lần {attempt + 1}/{max_retries} sau {delay:.2f} giây...")
+            
+            # Tạm dừng thực thi
+            time.sleep(delay)
     raise NotImplementedError("Implement retry_with_backoff")
 
 
@@ -246,6 +476,24 @@ def batch_compare(prompts: list[str]) -> list[dict]:
         key "prompt" containing the original prompt string.
     """
     # TODO: iterate over prompts, call compare_models, and inject the original "prompt".
+    results = []
+    
+    # Duyệt qua từng prompt trong danh sách
+    for prompt in prompts:
+        try:
+            # Gọi hàm compare_models (Task 4)
+            comparison_result = compare_models(prompt)
+        except Exception as e:
+            # Nếu có lỗi (VD: mất mạng khi đang chạy giữa chừng), tạo dict ghi nhận lỗi
+            comparison_result = {"error": str(e)}
+        
+        # Thêm key "prompt" chứa nội dung gốc vào dictionary kết quả
+        comparison_result["prompt"] = prompt
+        
+        # Đưa vào danh sách kết quả tổng
+        results.append(comparison_result)
+        
+    return results
     raise NotImplementedError("Implement batch_compare")
 
 
