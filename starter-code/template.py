@@ -10,10 +10,12 @@ Instructions:
 """
 from google import genai
 from google.genai import types
+import anthropic
+import openai
 import os
+import sys
 import time
 from typing import Any, Callable
-from openai import OpenAI
 
 # ---------------------------------------------------------------------------
 # Estimated costs per 1M INPUT & OUTPUT tokens (USD) as of March 2026
@@ -70,7 +72,7 @@ def call_openai(
     # TODO: Import OpenAI, instantiate client, call chat.completions.create with parameters,
     #       measure execution start/end time, extract text and token usage, and return them.
     # Khởi tạo client, API key sẽ tự động lấy từ os.getenv("OPENAI_API_KEY")
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     
     # Định dạng tin nhắn gửi đi
     messages = [{"role": "user", "content": prompt}]
@@ -178,25 +180,15 @@ def call_gemini(
         # 6. Lấy Token Usage từ usage_metadata
         input_tokens = response.usage_metadata.prompt_token_count
         output_tokens = response.usage_metadata.candidates_token_count
-        total_tokens = response.usage_metadata.total_token_count
         
-        # Trả về kết quả
-        return {
-            "status": "success",
-            "content": response_text,
-            "latency_seconds": round(latency, 4),
+        # Trả về kết quả dưới dạng tuple
+        return response_text, round(latency, 4), {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
-            "total_tokens": total_tokens
         }
-        
-    except Exception as e:
-        # Xử lý lỗi nếu API key sai hoặc có sự cố mạng
-        return {
-            "status": "error",
-            "error_message": str(e)
-        }
-    raise NotImplementedError("Implement call_gemini")
+    except Exception:
+        # Nếu có lỗi, trả lại ngoại lệ để caller xử lý
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -231,9 +223,26 @@ def call_anthropic(
         client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
         # response.usage contains input_tokens and output_tokens
     """
-    # TODO: Initialize Anthropic client, create message, measure latency,
-    #       extract content text and usage statistics, and return the tuple.
-    raise NotImplementedError("Implement call_anthropic")
+    client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+    
+    start_time = time.time()
+    response = client.messages.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=temperature,
+        top_p=top_p,
+        max_tokens_to_sample=max_tokens,
+    )
+    latency_seconds = time.time() - start_time
+    response_text = ""
+    if response.content:
+        response_text = response.content[-1].text
+
+    usage = {
+        "input_tokens": response.usage.input_tokens,
+        "output_tokens": response.usage.output_tokens,
+    }
+    return response_text, latency_seconds, usage
 
 
 # ---------------------------------------------------------------------------
@@ -286,21 +295,12 @@ def compare_models(prompt: str) -> dict:
 
 
     # --- 3. Gọi Gemini 2.5 Flash ---
-    # Dựa vào Task 2, giả sử call_gemini trả về dictionary trực tiếp:
-    # {"content": str, "latency_seconds": float, "input_tokens": int, "output_tokens": int, ...}
-    gemini_result = call_gemini(prompt=prompt, model="gemini-2.5-flash")
-    
-    # Xử lý trường hợp có thể lỗi từ hàm call_gemini
-    if gemini_result.get("status") == "error":
-        gemini_text = f"Lỗi: {gemini_result.get('error_message')}"
-        gemini_latency = 0.0
-        gemini_in_tok = 0
-        gemini_out_tok = 0
-    else:
-        gemini_text = gemini_result.get("content", "")
-        gemini_latency = gemini_result.get("latency_seconds", 0.0)
-        gemini_in_tok = gemini_result.get("input_tokens", 0)
-        gemini_out_tok = gemini_result.get("output_tokens", 0)
+    gemini_text, gemini_latency, gemini_usage = call_gemini(
+        prompt=prompt,
+        model="gemini-2.5-flash"
+    )
+    gemini_in_tok = gemini_usage.get("input_tokens", 0)
+    gemini_out_tok = gemini_usage.get("output_tokens", 0)
 
     gemini_cost = (
         gemini_in_tok * PRICING_1M_TOKENS["gemini-2.5-flash"]["input"] + 
@@ -413,12 +413,7 @@ def streaming_chatbot() -> None:
             # Nếu gọi API lỗi, hãy xóa tin nhắn user vừa thêm vào để tránh làm hỏng cấu trúc so le (user-model)
             if history and history[-1]["role"] == "user":
                 history.pop()
-    raise NotImplementedError("Implement streaming_chatbot")
-
-
-
-# ---------------------------------------------------------------------------
-# Bonus Task A — Retry with exponential backoff
+    return None
 # ---------------------------------------------------------------------------
 def retry_with_backoff(
     fn: Callable[[], Any],
@@ -511,8 +506,47 @@ def format_comparison_table(results: list[dict]) -> str:
         A beautiful Markdown table string with columns:
         | Prompt | Model | Response (truncated) | Latency | Tokens (In/Out) | Cost (USD) |
     """
-    # TODO: Build and return the formatted table string. Truncate response to 50 chars for clean display.
-    raise NotImplementedError("Implement format_comparison_table")
+    def _truncate(text: str, length: int = 50) -> str:
+        if text is None:
+            return ""
+        return text if len(text) <= length else text[:length - 3] + "..."
+
+    header = [
+        "Prompt",
+        "Model",
+        "Response (truncated)",
+        "Latency",
+        "Tokens (In/Out)",
+        "Cost (USD)",
+    ]
+    lines = ["| " + " | ".join(header) + " |",
+             "|" + " --- |" * len(header)]
+
+    for result in results:
+        prompt = result.get("prompt", "")
+        if "error" in result:
+            error_text = _truncate(result["error"], 50)
+            for model_name in ["GPT-4o", "GPT-4o-Mini", "Gemini-Flash"]:
+                lines.append(
+                    f"| {prompt} | {model_name} | ERROR: {error_text} | - | - | - |"
+                )
+        else:
+            rows = [
+                ("GPT-4o", result.get("gpt4o", {})),
+                ("GPT-4o-Mini", result.get("gpt4o_mini", {})),
+                ("Gemini-Flash", result.get("gemini_flash", {})),
+            ]
+            for model_name, stats in rows:
+                response = _truncate(stats.get("response", ""))
+                latency = stats.get("latency", "-")
+                in_tok = stats.get("input_tokens", "-")
+                out_tok = stats.get("output_tokens", "-")
+                cost = stats.get("cost", "-")
+                lines.append(
+                    f"| {prompt} | {model_name} | {response} | {latency} | {in_tok}/{out_tok} | {cost} |"
+                )
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
